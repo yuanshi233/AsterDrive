@@ -1,0 +1,50 @@
+# WebDAV client E2E compatibility workflow.
+#
+# Installs pinned versions of rclone, cadaver, and curl, then runs
+# test_webdav_client_e2e.rs against a real AsterDrive WebDAV server.
+
+name: WebDAV Client E2E
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 9 * * 0'
+
+concurrency:
+  group: client-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_TEST_CODEGEN_UNITS: '16'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+
+jobs:
+  client-e2e:
+    name: rclone / cadaver / curl
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install rclone
+        run: |
+          RCLONE_VERSION=1.69.2
+          curl -fsSL "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.deb" \
+            -o /tmp/rclone.deb
+          sudo dpkg -i /tmp/rclone.deb
+          rclone version
+
+      - name: Install cadaver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cadaver
+
+      - name: Run WebDAV client E2E tests
+        run: |
+          cargo test --test test_webdav_client_e2e \
+            -- --ignored --nocapture

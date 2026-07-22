@@ -1,0 +1,91 @@
+# Litmus WebDAV compliance workflow.
+#
+# Builds pinned Litmus from source, starts AsterDrive, and runs the five core
+# RFC 4918 test groups (basic, copymove, props, locks, http).  Per-suite
+# artifacts (stdout, stderr, request log, server log, debug.log, child.log,
+# result.json) are uploaded for offline inspection.
+#
+# Manual trigger (workflow_dispatch) is the primary entry point during Phase 0.
+# A scheduled cron trigger can be added once the baseline stabilises.
+
+name: WebDAV Litmus
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly Sunday 09:00 UTC — keep the baseline honest without burning CI
+    # minutes on every push.
+    - cron: '0 9 * * 0'
+
+concurrency:
+  group: litmus-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_TEST_CODEGEN_UNITS: '16'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  ASTER_WEBDAV_COMPAT_ARTIFACT_DIR: /tmp/asterdrive-litmus-artifacts
+
+jobs:
+  litmus:
+    name: Litmus 0.13 compliance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            libneon27-dev \
+            libneon27-gnutls-dev \
+            libxml2-dev \
+            pkg-config
+
+      - name: Cache Litmus build
+        id: cache-litmus
+        uses: actions/cache@v4
+        with:
+          path: /tmp/litmus-build
+          key: litmus-0.13-${{ runner.os }}
+
+      - name: Build and install Litmus 0.13
+        if: steps.cache-litmus.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch litmus-0.13 \
+            https://github.com/notroj/litmus.git /tmp/litmus-src
+          mkdir -p /tmp/litmus-build
+          cd /tmp/litmus-src
+          ./configure --prefix=/tmp/litmus-build
+          make -j"$(nproc)"
+          make install
+          # Verify expected binaries exist
+          ls -la /tmp/litmus-build/bin/litmus
+          # Install to system path for the test runner
+          sudo cp /tmp/litmus-build/bin/litmus /usr/local/bin/
+          echo "LITMUS_BIN=/usr/local/bin/litmus" >> "$GITHUB_ENV"
+
+      - name: Prepare artifact directory
+        run: mkdir -p "$ASTER_WEBDAV_COMPAT_ARTIFACT_DIR"
+
+      - name: Run Litmus compliance tests
+        run: |
+          cargo test --test test_litmus_compliance \
+            -- --ignored --nocapture 2>&1 | \
+            tee "$ASTER_WEBDAV_COMPAT_ARTIFACT_DIR/test-run.log"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: litmus-artifacts
+          path: /tmp/asterdrive-litmus-artifacts/
+          if-no-files-found: warn
