@@ -39,12 +39,25 @@ jobs:
           sudo dpkg -i /tmp/rclone.deb
           rclone version
 
-      - name: Install cadaver
+      - name: Install cadaver 0.23
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cadaver
+          sudo apt-get install -y --no-install-recommends cadaver=0.23.3*
+          cadaver --version
+
+      - name: Verify curl version
+        run: |
+          curl --version | head -1
 
       - name: Run WebDAV client E2E tests
         run: |
           cargo test --test test_webdav_client_e2e \
             -- --ignored --nocapture
+
+      - name: Upload client E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-e2e-results
+          path: /tmp/asterdrive-client-e2e-artifacts/
+          if-no-files-found: warn
