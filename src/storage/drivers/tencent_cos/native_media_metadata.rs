@@ -1,8 +1,6 @@
-use std::io::Cursor;
-
 use async_trait::async_trait;
+use aster_forge_xml::{Element, ParseOptions};
 use chrono::Utc;
-use xmltree::{Element, XMLNode};
 
 use crate::errors::{AsterError, MapAsterErr, Result};
 use crate::storage::error::{StorageErrorKind, storage_driver_error};
@@ -12,11 +10,19 @@ use crate::storage::traits::extensions::{
 use crate::types::{
     AudioMediaMetadata, MediaMetadataKind, MediaMetadataPayload, VideoMediaMetadata,
 };
+use crate::xml_utils::{local_name_eq_ignore_case, non_empty_owned_text};
 
 use super::{MAX_COS_THUMBNAIL_TTL, TencentCosDriver};
 
 const COS_NATIVE_MEDIA_METADATA_PARSER: &str = "tencent_cos_ci_videoinfo";
 const COS_NATIVE_MEDIA_METADATA_VERSION: &str = "1";
+
+fn media_info_xml_options() -> ParseOptions {
+    ParseOptions::new()
+        .max_size(256 * 1024)
+        .max_depth(16)
+        .max_elements(500)
+}
 
 impl TencentCosDriver {
     pub(super) fn signed_ci_media_info_url(&self, path: &str) -> Result<String> {
@@ -89,7 +95,7 @@ fn parse_cos_media_info_xml(
     body: &[u8],
     kind: MediaMetadataKind,
 ) -> Result<NativeMediaMetadataResult> {
-    let root = Element::parse(Cursor::new(body)).map_aster_err_ctx(
+    let root = Element::from_reader(body, &media_info_xml_options()).map_aster_err_ctx(
         "parse COS native media metadata XML",
         AsterError::storage_driver_error,
     )?;
@@ -213,21 +219,19 @@ fn display_dimensions(
 }
 
 fn first_descendant<'a>(element: &'a Element, name: &str) -> Option<&'a Element> {
-    if xml_name_matches(&element.name, name) {
+    if local_name_eq_ignore_case(&element.name, name) {
         return Some(element);
     }
-    element.children.iter().find_map(|child| match child {
-        XMLNode::Element(child) => first_descendant(child, name),
-        _ => None,
-    })
+    element
+        .children
+        .iter()
+        .find_map(|child| first_descendant(child, name))
 }
 
 fn descendant_count(element: &Element, name: &str) -> u32 {
-    let mut count = u32::from(xml_name_matches(&element.name, name));
+    let mut count = u32::from(local_name_eq_ignore_case(&element.name, name));
     for child in &element.children {
-        if let XMLNode::Element(child) = child {
-            count = count.saturating_add(descendant_count(child, name));
-        }
+        count = count.saturating_add(descendant_count(child, name));
     }
     count
 }
@@ -237,16 +241,8 @@ fn child_string(element: &Element, names: &[&str]) -> Option<String> {
         element
             .children
             .iter()
-            .filter_map(|child| match child {
-                XMLNode::Element(child) if xml_name_matches(&child.name, name) => Some(child),
-                _ => None,
-            })
-            .find_map(|child| {
-                child
-                    .get_text()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-            })
+            .filter(|child| local_name_eq_ignore_case(&child.name, name))
+            .find_map(|child| non_empty_owned_text(child.get_text()))
     })
 }
 
@@ -280,21 +276,13 @@ fn child_duration_ms(element: &Element, names: &[&str]) -> Option<u64> {
     })
 }
 
-fn xml_name_matches(actual: &str, expected: &str) -> bool {
-    actual
-        .rsplit_once(':')
-        .map(|(_, local)| local)
-        .unwrap_or(actual)
-        .eq_ignore_ascii_case(expected)
-}
+// Case-insensitive local-name matching is provided by crate::xml_utils::local_name_eq_ignore_case.
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
     use super::{child_duration_ms, parse_cos_media_info_xml};
     use crate::types::{MediaMetadataKind, MediaMetadataPayload};
-    use xmltree::Element;
+    use aster_forge_xml::Element;
 
     #[test]
     fn parses_cos_video_media_info_xml() {
@@ -383,15 +371,14 @@ mod tests {
 
     #[test]
     fn parses_cos_duration_with_checked_rounding_and_rejects_invalid_values() {
-        let rounded = Element::parse(Cursor::new(
-            br#"<Video><Duration>1.2345</Duration></Video>"#.as_slice(),
-        ))
-        .unwrap();
+        let rounded =
+            Element::from_bytes(br#"<Video><Duration>1.2345</Duration></Video>"#.as_slice())
+                .unwrap();
         assert_eq!(child_duration_ms(&rounded, &["Duration"]), Some(1235));
 
         for value in ["0", "-1", "NaN", "not-a-number"] {
             let xml = format!("<Video><Duration>{value}</Duration></Video>");
-            let element = Element::parse(Cursor::new(xml.as_bytes())).unwrap();
+            let element = Element::from_bytes(xml.as_bytes()).unwrap();
             assert_eq!(child_duration_ms(&element, &["Duration"]), None);
         }
     }
