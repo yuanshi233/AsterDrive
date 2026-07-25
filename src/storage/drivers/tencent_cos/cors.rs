@@ -1,23 +1,37 @@
-use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aster_forge_xml::{Element, ParseOptions, SerializeOptions};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use md5::{Digest as Md5Digest, Md5};
 use reqwest::StatusCode;
 use reqwest::header::CONTENT_TYPE;
-use xmltree::{Element, EmitterConfig, XMLNode};
 
 use crate::api::api_error_code::ApiErrorCode;
 use crate::errors::{AsterError, MapAsterErr, Result};
 use crate::storage::error::{
     StorageErrorKind, storage_driver_error, storage_driver_error_with_code,
 };
+use crate::xml_utils::{local_name_eq, non_empty_owned_text};
 
 use super::TencentCosDriver;
 
 pub(crate) const ASTERDRIVE_COS_CORS_RULE_ID: &str = "asterdrive-presigned-access";
 const CORS_XML_CONTENT_TYPE: &str = "application/xml";
 const CONTENT_MD5_HEADER: &str = "Content-MD5";
+
+fn cors_xml_options() -> ParseOptions {
+    ParseOptions::new()
+        .max_size(64 * 1024)
+        .max_depth(16)
+        .max_elements(500)
+}
+
+fn error_xml_options() -> ParseOptions {
+    ParseOptions::new()
+        .max_size(16 * 1024)
+        .max_depth(8)
+        .max_elements(100)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CosCorsRule {
@@ -170,8 +184,7 @@ pub(crate) fn asterdrive_cors_rule(allowed_origins: &[String]) -> CosCorsRule {
 pub(crate) fn build_cors_configuration_xml(config: &CosCorsConfiguration) -> Result<String> {
     let mut root = Element::new("CORSConfiguration");
     for rule in &config.rules {
-        root.children
-            .push(XMLNode::Element(cors_rule_element(rule)));
+        root.push(cors_rule_element(rule));
     }
     if let Some(response_vary) = config.response_vary {
         push_text_child(
@@ -182,21 +195,16 @@ pub(crate) fn build_cors_configuration_xml(config: &CosCorsConfiguration) -> Res
     }
 
     let mut bytes = Vec::new();
-    root.write_with_config(
-        &mut bytes,
-        EmitterConfig::new()
-            .perform_indent(true)
-            .write_document_declaration(true),
-    )
-    .map_aster_err_ctx("serialize COS CORS XML", AsterError::storage_driver_error)?;
+    root.write_with_config(&mut bytes, &SerializeOptions::new())
+        .map_aster_err_ctx("serialize COS CORS XML", AsterError::storage_driver_error)?;
     String::from_utf8(bytes)
         .map_aster_err_ctx("encode COS CORS XML", AsterError::storage_driver_error)
 }
 
 pub(crate) fn parse_cors_configuration(body: &str) -> Result<CosCorsConfiguration> {
-    let root = Element::parse(Cursor::new(body.as_bytes()))
+    let root = Element::from_reader(body.as_bytes(), &cors_xml_options())
         .map_aster_err_ctx("parse COS CORS XML", AsterError::storage_driver_error)?;
-    if !xml_name_matches(&root.name, "CORSConfiguration") {
+    if !local_name_eq(&root.name, "CORSConfiguration") {
         return Err(storage_driver_error(
             StorageErrorKind::Misconfigured,
             "COS CORS XML root is not CORSConfiguration",
@@ -204,8 +212,8 @@ pub(crate) fn parse_cors_configuration(body: &str) -> Result<CosCorsConfiguratio
     }
 
     let mut rules = Vec::new();
-    for child in root.children.iter().filter_map(as_element) {
-        if xml_name_matches(&child.name, "CORSRule") {
+    for child in &root.children {
+        if local_name_eq(&child.name, "CORSRule") {
             rules.push(parse_cors_rule(child));
         }
     }
@@ -253,43 +261,28 @@ fn parse_cors_rule(element: &Element) -> CosCorsRule {
 }
 
 fn push_text_child(element: &mut Element, name: &str, value: &str) {
-    let mut child = Element::new(name);
-    child.children.push(XMLNode::Text(value.to_string()));
-    element.children.push(XMLNode::Element(child));
+    element.push(Element::new(name).with_text(value));
 }
 
 fn child_texts(element: &Element, name: &str) -> Vec<String> {
     element
         .children
         .iter()
-        .filter_map(as_element)
-        .filter(|child| xml_name_matches(&child.name, name))
-        .filter_map(element_text)
+        .filter(|child| local_name_eq(&child.name, name))
+        .filter_map(|child| non_empty_owned_text(child.get_text()))
         .collect()
 }
 
 fn child_text(element: &Element, name: &str) -> Option<String> {
-    child_texts(element, name).into_iter().next()
+    element
+        .children
+        .iter()
+        .filter(|child| local_name_eq(&child.name, name))
+        .find_map(|child| non_empty_owned_text(child.get_text()))
 }
 
 fn element_text(element: &Element) -> Option<String> {
-    let text = element.get_text()?.trim().to_string();
-    (!text.is_empty()).then_some(text)
-}
-
-fn as_element(node: &XMLNode) -> Option<&Element> {
-    match node {
-        XMLNode::Element(element) => Some(element),
-        _ => None,
-    }
-}
-
-fn xml_name_matches(actual: &str, expected: &str) -> bool {
-    actual
-        .rsplit_once(':')
-        .map(|(_, local)| local)
-        .unwrap_or(actual)
-        == expected
+    non_empty_owned_text(element.get_text())
 }
 
 fn cos_key_time() -> Result<String> {
@@ -345,18 +338,17 @@ fn cos_cors_response_error(status: StatusCode, body: &str, action: &str) -> Aste
 }
 
 fn extract_xml_tag(body: &str, tag: &str) -> Option<String> {
-    let root = Element::parse(Cursor::new(body.as_bytes())).ok()?;
+    let root = Element::from_reader(body.as_bytes(), &error_xml_options()).ok()?;
     find_xml_tag_text(&root, tag)
 }
 
 fn find_xml_tag_text(element: &Element, tag: &str) -> Option<String> {
-    if xml_name_matches(&element.name, tag) {
+    if local_name_eq(&element.name, tag) {
         return element_text(element);
     }
     element
         .children
         .iter()
-        .filter_map(as_element)
         .find_map(|child| find_xml_tag_text(child, tag))
 }
 
